@@ -1,0 +1,301 @@
+// Copyright (c) 2013-2015 The btcsuite developers
+// Copyright (c) 2015-2016 The Decred developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package rpcchainexporter
+
+import (
+	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/decred/dcrd/dcrjson"
+	"github.com/decred/dcrutil"
+
+	flags "github.com/btcsuite/go-flags"
+)
+
+
+const (
+	// unusableFlags are the command usage flags which this utility are not
+	// able to use.  In particular it doesn't support websockets and
+	// consequently notifications.
+	unusableFlags = dcrjson.UFWebsocketOnly | dcrjson.UFNotification
+)
+
+var (
+	dcrdHomeDir           = dcrutil.AppDataDir("dcrd", false)
+	dcrctlHomeDir         = dcrutil.AppDataDir("dcrctl", false)
+	dcrwalletHomeDir      = dcrutil.AppDataDir("dcrwallet", false)
+	defaultConfigFile     = filepath.Join(dcrctlHomeDir, "dcrctl.conf")
+	defaultRPCServer      = "localhost"
+	defaultRPCCertFile    = filepath.Join(dcrdHomeDir, "rpc.cert")
+	defaultWalletCertFile = filepath.Join(dcrwalletHomeDir, "rpc.cert")
+)
+
+// listCommands categorizes and lists all of the usable commands along with
+// their one-line usage.
+func listCommands() {
+	const (
+		categoryChain uint8 = iota
+		categoryWallet
+		numCategories
+	)
+
+	// Get a list of registered commands and categorize and filter them.
+	cmdMethods := dcrjson.RegisteredCmdMethods()
+	categorized := make([][]string, numCategories)
+	for _, method := range cmdMethods {
+		flags, err := dcrjson.MethodUsageFlags(method)
+		if err != nil {
+			// This should never happen since the method was just
+			// returned from the package, but be safe.
+			continue
+		}
+
+		// Skip the commands that aren't usable from this utility.
+		if flags&unusableFlags != 0 {
+			continue
+		}
+
+		usage, err := dcrjson.MethodUsageText(method)
+		if err != nil {
+			// This should never happen since the method was just
+			// returned from the package, but be safe.
+			continue
+		}
+
+		// Categorize the command based on the usage flags.
+		category := categoryChain
+		if flags&dcrjson.UFWalletOnly != 0 {
+			category = categoryWallet
+		}
+		categorized[category] = append(categorized[category], usage)
+	}
+
+	// Display the command according to their categories.
+	categoryTitles := make([]string, numCategories)
+	categoryTitles[categoryChain] = "Chain Server Commands:"
+	categoryTitles[categoryWallet] = "Wallet Server Commands (--wallet):"
+	for category := uint8(0); category < numCategories; category++ {
+		fmt.Println(categoryTitles[category])
+		for _, usage := range categorized[category] {
+			fmt.Println(usage)
+		}
+		fmt.Println()
+	}
+}
+
+
+// config defines the configuration options for dcrctl.
+//
+// See loadConfig for details on the configuration load process.
+type config struct {
+	ShowVersion   bool   `short:"V" long:"version" description:"Display version information and exit"`
+	ListCommands  bool   `short:"l" long:"listcommands" description:"List all of the supported commands and exit"`
+	ConfigFile    string `short:"C" long:"configfile" description:"Path to configuration file"`
+	RPCUser       string `short:"u" long:"rpcuser" description:"RPC username"`
+	RPCPassword   string `short:"P" long:"rpcpass" default-mask:"-" description:"RPC password"`
+	RPCServer     string `short:"s" long:"rpcserver" description:"RPC server to connect to"`
+	RPCCert       string `short:"c" long:"rpccert" description:"RPC server certificate chain for validation"`
+	PrintJSON     bool   `short:"j" long:"json" description:"Print json messages sent and received"`
+	NoTLS         bool   `long:"notls" description:"Disable TLS"`
+	Proxy         string `long:"proxy" description:"Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)"`
+	ProxyUser     string `long:"proxyuser" description:"Username for proxy server"`
+	ProxyPass     string `long:"proxypass" default-mask:"-" description:"Password for proxy server"`
+	TestNet       bool   `long:"testnet" description:"Connect to testnet"`
+	SimNet        bool   `long:"simnet" description:"Connect to the simulation test network"`
+	TLSSkipVerify bool   `long:"skipverify" description:"Do not verify tls certificates (not recommended!)"`
+	Wallet        bool   `long:"wallet" description:"Connect to wallet"`
+}
+
+// normalizeAddress returns addr with the passed default port appended if
+// there is not already a port specified.
+func normalizeAddress(addr string, useTestNet, useSimNet, useWallet bool) string {
+	_, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		var defaultPort string
+		switch {
+		case useTestNet:
+			if useWallet {
+				defaultPort = "19110"
+			} else {
+				defaultPort = "19109"
+			}
+		case useSimNet:
+			if useWallet {
+				defaultPort = "19557"
+			} else {
+				defaultPort = "19556"
+			}
+		default:
+			if useWallet {
+				defaultPort = "9110"
+			} else {
+				defaultPort = "9109"
+			}
+		}
+
+		return net.JoinHostPort(addr, defaultPort)
+	}
+	return addr
+}
+
+// cleanAndExpandPath expands environement variables and leading ~ in the
+// passed path, cleans the result, and returns it.
+func cleanAndExpandPath(path string) string {
+	// Expand initial ~ to OS specific home directory.
+	if strings.HasPrefix(path, "~") {
+		homeDir := filepath.Dir(dcrctlHomeDir)
+		path = strings.Replace(path, "~", homeDir, 1)
+	}
+
+	// NOTE: The os.ExpandEnv doesn't work with Windows-style %VARIABLE%,
+	// but they variables can still be expanded via POSIX-style $VARIABLE.
+	return filepath.Clean(os.ExpandEnv(path))
+}
+
+// filesExists reports whether the named file or directory exists.
+func fileExists(name string) bool {
+	if _, err := os.Stat(name); err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+
+
+
+// loadConfig initializes and parses the config using a config file and command
+// line options.
+//
+// The configuration proceeds as follows:
+// 	1) Start with a default config with sane settings
+// 	2) Pre-parse the command line to check for an alternative config file
+// 	3) Load configuration file overwriting defaults with any specified options
+// 	4) Parse CLI options and overwrite/add any specified options
+//
+// The above results in functioning properly without any config settings
+// while still allowing the user to override settings with config files and
+// command line options.  Command line options always take precedence.
+func loadConfig() (*config, []string, error) {
+	// Default config.
+	cfg := config{
+		ConfigFile: defaultConfigFile,
+		RPCServer:  defaultRPCServer,
+		RPCCert:    defaultRPCCertFile,
+		RPCPassword: "pass",
+		RPCUser: "user",
+	}
+
+	// Pre-parse the command line options to see if an alternative config
+	// file, the version flag, or the list commands flag was specified.  Any
+	// errors aside from the help message error can be ignored here since
+	// they will be caught by the final parse below.
+	preCfg := cfg
+	preParser := flags.NewParser(&preCfg, flags.HelpFlag)
+	_, _ = preParser.Parse()
+
+	// Multiple networks can't be selected simultaneously.
+	numNets := 0
+	if cfg.TestNet {
+		numNets++
+	}
+	if cfg.SimNet {
+		numNets++
+	}
+	if numNets > 1 {
+		str := "%s: The testnet and simnet params can't be used " +
+			"together -- choose one of the two"
+		err := fmt.Errorf(str, "loadConfig")
+		fmt.Fprintln(os.Stderr, err)
+		return nil, nil, err
+	}
+
+	// Override the RPC certificate if the --wallet flag was specified and
+	// the user did not specify one.
+	if cfg.Wallet && cfg.RPCCert == defaultRPCCertFile {
+		cfg.RPCCert = defaultWalletCertFile
+	}
+
+	// Handle environment variable expansion in the RPC certificate path.
+	cfg.RPCCert = cleanAndExpandPath(cfg.RPCCert)
+
+	// Add default port to RPC server based on --testnet and --wallet flags
+	// if needed.
+	cfg.RPCServer = normalizeAddress(cfg.RPCServer, cfg.TestNet,
+		cfg.SimNet, cfg.Wallet)
+
+	return &cfg, nil, nil
+}
+
+// createDefaultConfig creates a basic config file at the given destination path.
+// For this it tries to read the dcrd config file at its default path, and extract
+// the RPC user and password from it.
+func createDefaultConfigFile(destinationPath string) error {
+	// Nothing to do when there is no existing dcrd conf file at the default
+	// path to extract the details from.
+	dcrdConfigPath := filepath.Join(dcrdHomeDir, "dcrd.conf")
+	if !fileExists(dcrdConfigPath) {
+		return nil
+	}
+
+	// Read dcrd.conf from its default path
+	dcrdConfigFile, err := os.Open(dcrdConfigPath)
+	if err != nil {
+		return err
+	}
+	defer dcrdConfigFile.Close()
+	content, err := ioutil.ReadAll(dcrdConfigFile)
+	if err != nil {
+		return err
+	}
+
+	// Extract the rpcuser
+	rpcUserRegexp, err := regexp.Compile(`(?m)^\s*rpcuser=([^\s]+)`)
+	if err != nil {
+		return err
+	}
+	userSubmatches := rpcUserRegexp.FindSubmatch(content)
+	if userSubmatches == nil {
+		// No user found, nothing to do
+		return nil
+	}
+
+	// Extract the rpcpass
+	rpcPassRegexp, err := regexp.Compile(`(?m)^\s*rpcpass=([^\s]+)`)
+	if err != nil {
+		return err
+	}
+	passSubmatches := rpcPassRegexp.FindSubmatch(content)
+	if passSubmatches == nil {
+		// No password found, nothing to do
+		return nil
+	}
+
+	// Create the destination directory if it does not exists
+	err = os.MkdirAll(filepath.Dir(destinationPath), 0700)
+	if err != nil {
+		return err
+	}
+
+	// Create the destination file and write the rpcuser and rpcpass to it
+	dest, err := os.OpenFile(destinationPath,
+		os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+
+	dest.WriteString(fmt.Sprintf("rpcuser=%s\nrpcpass=%s",
+		string(userSubmatches[1]), string(passSubmatches[1])))
+
+	return nil
+}
